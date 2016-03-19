@@ -413,6 +413,9 @@ void CWallet::MarkDirty()
         BOOST_FOREACH(PAIRTYPE(const uint256, CWalletTx)& item, mapWallet)
             item.second.MarkDirty();
     }
+    addressStakeCache.clear();
+    addressUnconfirmedBalanceCache.clear();
+    addressCreditCache.clear();
 }
 
 bool CWallet::AddToWallet(const CWalletTx& wtxIn)
@@ -544,6 +547,8 @@ bool CWallet::AddToWallet(const CWalletTx& wtxIn)
     }
     return true;
 }
+
+
 
 // Add a transaction to the wallet, or update it.
 // pblock is optional, but should be provided if the transaction is known to be in a block.
@@ -839,15 +844,32 @@ bool CWalletTx::WriteToDisk()
 // Scan the block chain (starting in pindexStart) for transactions
 // from or to us. If fUpdate is true, found transactions that already
 // exist in the wallet will be updated.
-int CWallet::ScanForWalletTransactions(CBlockIndex* pindexStart, bool fUpdate)
+int CWallet::ScanForWalletTransactions(CBlockIndex* pindexStart, bool fUpdate, int* pNumEpochTransactionsScanned, int* pNumEpochTransactionsToScan)
 {
     int ret = 0;
 
     CBlockIndex* pindex = pindexStart;
+    CBlockIndex* pindexEnd = pindexBest;
+    if (pNumEpochTransactionsToScan && pNumEpochTransactionsScanned)
     {
-        LOCK(cs_wallet);
-        while (pindex)
+        *pNumEpochTransactionsToScan = 0;
+        *pNumEpochTransactionsScanned = 0;
+        while (pindex->pnext && pindex != pindexEnd)
         {
+            ++(*pNumEpochTransactionsToScan);
+            pindex = pindex->pnext;
+        }
+        pindex = pindexStart;
+    }
+    {
+        //LOCK(cs_wallet);
+        //fixme:
+        while (pindex!=NULL && pindex!=pindexEnd)
+        {
+            // Speed exiting up.
+            if (currentLoadState == LoadState_Exiting)
+                return 0;
+
             // no need to read and scan block, if block was created before
             // our wallet birthday (as adjusted for block time variability)
             if (nTimeFirstKey && (pindex->nTime < (nTimeFirstKey - 7200))) {
@@ -856,13 +878,20 @@ int CWallet::ScanForWalletTransactions(CBlockIndex* pindexStart, bool fUpdate)
             }
 
             CBlock block;
-            block.ReadFromDisk(pindex, true);
+            {
+                LOCK(cs_IO);
+                FlushBlockFile();
+                block.ReadFromDisk(pindex, true);
+            }
+
             BOOST_FOREACH(CTransaction& tx, block.vtx)
             {
                 if (AddToWalletIfInvolvingMe(tx, &block, fUpdate))
                     ret++;
             }
             pindex = pindex->pnext;
+            if (pNumEpochTransactionsScanned)
+                ++(*pNumEpochTransactionsScanned);
         }
     }
     return ret;
@@ -1012,15 +1041,98 @@ void CWallet::ResendWalletTransactions(bool fForce)
 }
 
 
-
-
-
-
 //////////////////////////////////////////////////////////////////////////////
 //
 // Actions
 //
 
+int64_t CWallet::GetCreditForAddress(const CTransaction& tx, std::string addr, bool fUseCache) const
+{
+    if(fUseCache)
+    {
+        std::map<std::string, int64_t>::const_iterator iter = addressCreditCache.find(addr);
+        if(iter != addressCreditCache.end())
+        {
+            return iter->second;
+        }
+    }
+
+    int64_t nCredit = 0;
+    try
+    {
+        BOOST_FOREACH(const CTxOut& txout, tx.vout)
+        {
+            std::string compAddress = GetPrimaryAddress(txout, tx);
+            if(addr == compAddress)
+            {
+                nCredit += GetCredit(txout);
+            }
+        }
+    }
+    catch(...)
+    {
+    }
+
+    addressCreditCache[addr] = nCredit;
+    return nCredit;
+}
+
+int64_t CWalletTx::GetAvailableCreditForAddress(std::string addr, bool fUseCache) const
+{
+
+    // Must wait until coinbase is safely deep enough in the chain before valuing it
+    if((IsCoinBase() || IsCoinStake()) && GetBlocksToMaturity() > 0)
+        return 0;
+
+    if(fUseCache)
+    {
+        std::map<std::string, int64_t>::const_iterator iter = addressAvailableCreditCache.find(addr);
+        if(iter != addressAvailableCreditCache.end())
+        {
+            return iter->second;
+        }
+    }
+
+    int64_t nCredit = 0;
+    for(unsigned int i = 0; i < vout.size(); i++)
+    {
+        if(!IsSpent(i))
+        {
+            std::string compAddress = pwallet->GetPrimaryAddress(vout[i], *this);
+            if(addr == compAddress)
+            {
+                nCredit += pwallet->GetCredit(vout[i]);
+            }
+        }
+    }
+    addressAvailableCreditCache[addr] = nCredit;
+    return nCredit;
+}
+
+//stake = interest
+//unconfirmed = pending
+void CWallet::GetBalanceForAddress(std::string addr, int64_t& earningInterest,  int64_t& pending, int64_t& balance) const
+{
+    if (currentLoadState == LoadState_SyncHeadersFromEpoch)
+        return;
+
+    balance = 0;
+
+    {
+        LOCK(cs_wallet);
+        for (map<uint256, CWalletTx>::const_iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
+        {
+            const CWalletTx* pcoin = &(*it).second;
+            if (pcoin->IsTrusted())
+                balance += pcoin->GetAvailableCreditForAddress(addr);
+        }
+    }
+
+    earningInterest = GetStakeForAddress(addr);
+
+    pending = GetUnconfirmedBalanceForAddress(addr);
+
+}
 
 int64_t CWallet::GetBalance() const
 {
@@ -1050,6 +1162,32 @@ int64_t CWallet::GetUnconfirmedBalance() const
                 nTotal += pcoin->GetAvailableCredit();
         }
     }
+    return nTotal;
+}
+
+
+int64_t CWallet::GetUnconfirmedBalanceForAddress(std::string addr, bool fUseCache) const
+{
+    if(fUseCache)
+    {
+        std::map<std::string, int64_t>::const_iterator iter = addressUnconfirmedBalanceCache.find(addr);
+        if(iter != addressUnconfirmedBalanceCache.end())
+        {
+            return iter->second;
+        }
+    }
+
+    int64_t nTotal = 0;
+    {
+        LOCK(cs_wallet);
+        for (map<uint256, CWalletTx>::const_iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
+        {
+            const CWalletTx* pcoin = &(*it).second;
+            if (!pcoin->IsFinal() || (!pcoin->IsTrusted() && pcoin->GetDepthInMainChain() == 0))
+                nTotal += pcoin->GetAvailableCreditForAddress(addr);
+        }
+    }
+    addressUnconfirmedBalanceCache[addr] = nTotal;
     return nTotal;
 }
 
@@ -1165,6 +1303,7 @@ static void ApproximateBestSubset(vector<pair<int64_t, pair<const CWalletTx*,uns
     }
 }
 
+
 // ppcoin: total coins staked (non-spendable until maturity)
 int64_t CWallet::GetStake() const
 {
@@ -1176,6 +1315,32 @@ int64_t CWallet::GetStake() const
         if (pcoin->IsCoinStake() && pcoin->GetBlocksToMaturity() > 0 && pcoin->GetDepthInMainChain() > 0)
             nTotal += CWallet::GetCredit(*pcoin);
     }
+    return nTotal;
+}
+
+int64_t CWallet::GetStakeForAddress(std::string addrName, bool fUseCache) const
+{
+    if(fUseCache)
+    {
+        std::map<std::string, int64_t>::const_iterator iter = addressStakeCache.find(addrName);
+        if(iter != addressStakeCache.end())
+        {
+            return iter->second;
+        }
+    }
+
+    int64_t nTotal = 0;
+    LOCK(cs_wallet);
+    for (map<uint256, CWalletTx>::const_iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
+    {
+        const CWalletTx* pcoin = &(*it).second;
+        if (pcoin->IsCoinStake() && pcoin->GetBlocksToMaturity() > 0 && pcoin->GetDepthInMainChain() > 0)
+        {
+            //fixme: Temporarily disable cache here - it is calculating wrong when it comes to stake for some reason
+            nTotal += CWallet::GetCreditForAddress(*pcoin, addrName, false);
+        }
+    }
+    addressStakeCache[addrName]=nTotal;
     return nTotal;
 }
 
@@ -1301,10 +1466,16 @@ bool CWallet::SelectCoins(int64_t nTargetValue, set<pair<const CWalletTx*,unsign
     // coin control -> return all selected outputs (we want all selected to go into the transaction for sure)
     if (coinControl && coinControl->HasSelected())
     {
+        // randomise so that we can keep retrying different orders if transaction too big.
+        random_shuffle(vCoins.begin(), vCoins.end(), GetRandInt);
         BOOST_FOREACH(const COutput& out, vCoins)
         {
             nValueRet += out.tx->vout[out.i].nValue;
             setCoinsRet.insert(make_pair(out.tx, out.i));
+            if(nValueRet > nTargetValue)
+            {
+                break;
+            }
         }
         return (nValueRet >= nTargetValue);
     }
@@ -1354,7 +1525,7 @@ bool CWallet::SelectCoinsSimple(int64_t nTargetValue, int nMinConf, set<pair<con
     return true;
 }
 
-bool CWallet::CreateTransaction(const vector<pair<CScript, int64_t> >& vecSend, CWalletTx& wtxNew, CReserveKey& reservekey, int64_t& nFeeRet, const CCoinControl* coinControl)
+bool CWallet::CreateTransaction(const vector<pair<CScript, int64_t> >& vecSend, CWalletTx& wtxNew, CReserveKey& reservekey, int64_t& nFeeRet, const CCoinControl* coinControl, bool* transactionTooBig)
 {
     int64_t nValue = 0;
     BOOST_FOREACH (const PAIRTYPE(CScript, int64_t)& s, vecSend)
@@ -1374,6 +1545,8 @@ bool CWallet::CreateTransaction(const vector<pair<CScript, int64_t> >& vecSend, 
         CTxDB txdb("r");
         {
             nFeeRet = nTransactionFee;
+            //We retry a few times in case we are
+            int retries = 0;
             while (true)
             {
                 wtxNew.vin.clear();
@@ -1456,7 +1629,19 @@ bool CWallet::CreateTransaction(const vector<pair<CScript, int64_t> >& vecSend, 
                 // Limit size
                 unsigned int nBytes = ::GetSerializeSize(*(CTransaction*)&wtxNew, SER_NETWORK, PROTOCOL_VERSION);
                 if (nBytes >= MAX_BLOCK_SIZE_GEN/5)
+                {
+                    // Start again with different random coin order
+                    if(retries<50)
+                    {
+                        retries++;
+                        nFeeRet = nTransactionFee;
+                        continue;
+                    }
+                    // Out of retries just fail at this point.
+                    if(transactionTooBig)
+                        (*transactionTooBig) = true;
                     return false;
+                }
                 dPriority /= nBytes;
 
                 // Check that enough fee is included
@@ -1481,7 +1666,7 @@ bool CWallet::CreateTransaction(const vector<pair<CScript, int64_t> >& vecSend, 
     return true;
 }
 
-bool CWallet::CreateTransaction(CScript scriptPubKey, int64_t nValue, CWalletTx& wtxNew, CReserveKey& reservekey, int64_t& nFeeRet, const CCoinControl* coinControl)
+bool CWallet::CreateTransaction(CScript scriptPubKey, int64_t nValue, CWalletTx& wtxNew, CReserveKey& reservekey, int64_t& nFeeRet, const CCoinControl* coinControl, bool* transactionTooBig)
 {
     vector< pair<CScript, int64_t> > vecSend;
     vecSend.push_back(make_pair(scriptPubKey, nValue));
@@ -1925,6 +2110,72 @@ bool CWallet::DelAddressBookName(const CTxDestination& address)
     return CWalletDB(strWalletFile).EraseName(CBitcoinAddress(address).ToString());
 }
 
+
+
+
+std::string CWallet::GetPrimaryAddress(CTxOut txout, CTransaction tx) const
+{
+    try
+    {
+        CTxDestination compAddress;
+        if(ExtractDestination(txout.scriptPubKey, compAddress))
+        {
+            std::string subAddress = CBitcoinAddress(compAddress).ToString();
+            //fixme: CBSU - We can probably pre-fill this map when loading the wallet instead of calculating it on the fly constantly.
+            if(primaryAddressMap.find(subAddress) != primaryAddressMap.end())
+                return primaryAddressMap[subAddress];
+
+            CTxIn txin = tx.vin[0];
+            int count=0;
+            std::vector<std::string> addressStack;
+            addressStack.reserve(20);
+            addressStack.push_back(subAddress);
+            //fixme: Traversing this deep is a hack to avoid issues for now - we need to fix this in a better way.
+            while((!mapAddressBook.count(compAddress)) && count < 200)
+            {
+                count++;
+                std::map<uint256, CWalletTx>::const_iterator iter = mapWallet.find(txin.prevout.hash);
+                if(iter != mapWallet.end())
+                {
+                    CWalletTx prev = iter->second;
+                    ExtractDestination(prev.vout[txin.prevout.n].scriptPubKey,compAddress);
+                    txin = prev.vin[0];
+                    std::string parentAddress = CBitcoinAddress(compAddress).ToString();
+                    if(primaryAddressMap.find(parentAddress) != primaryAddressMap.end())
+                    {
+                        std::string primaryAddress = primaryAddressMap[parentAddress];
+                        BOOST_FOREACH(std::string addAddress, addressStack)
+                        {
+                            primaryAddressMap[addAddress] = primaryAddress;
+                        }
+                        return primaryAddress;
+                    }
+                    addressStack.push_back(parentAddress);
+                }
+            }
+            if(count < 200)
+            {
+                std::string primaryAddress = CBitcoinAddress(compAddress).ToString();
+                BOOST_FOREACH(std::string addAddress, addressStack)
+                {
+                    primaryAddressMap[addAddress] = primaryAddress;
+                }
+                return primaryAddress;
+            }
+        }
+    }
+    catch(...)
+    {
+    }
+
+    return "";
+}
+
+
+std::string CWallet::GetPrimaryAddress(CTxIn txin) const
+{
+    return GetPrimaryAddress(mapWallet.find(txin.prevout.hash)->second.vout[txin.prevout.n],mapWallet.find(txin.prevout.hash)->second);
+}
 
 void CWallet::PrintWallet(const CBlock& block)
 {
